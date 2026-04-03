@@ -19,7 +19,7 @@ const sessionPassword =
 
 const sessionOptions: SessionOptions = {
   password: sessionPassword,
-  cookieName: 'tic2k26_session',
+  cookieName: 'session',
   cookieOptions: {
     httpOnly: true,
     secure: process.env.NODE_ENV === 'production',
