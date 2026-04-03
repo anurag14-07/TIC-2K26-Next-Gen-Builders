@@ -1,0 +1,91 @@
+import { NextResponse } from 'next/server';
+import { getDashboardSession, type ThemeMode } from '@/lib/session';
+import type { SocialLinks } from '@/lib/types';
+
+const LINK_KEYS = ['github', 'linkedin', 'resume', 'twitter', 'portfolio', 'devto'] as const;
+
+function sanitizeTheme(input: unknown): ThemeMode | undefined {
+  if (input === 'light' || input === 'dark') {
+    return input;
+  }
+
+  return undefined;
+}
+
+function sanitizeExpandedJobs(input: unknown): boolean | undefined {
+  if (typeof input === 'boolean') {
+    return input;
+  }
+
+  return undefined;
+}
+
+function sanitizeLinks(input: unknown): Partial<SocialLinks> {
+  if (!input || typeof input !== 'object') {
+    return {};
+  }
+
+  const normalizedLinks: Partial<SocialLinks> = {};
+
+  for (const key of LINK_KEYS) {
+    const value = (input as Record<string, unknown>)[key];
+    if (typeof value === 'string') {
+      normalizedLinks[key] = value;
+    }
+  }
+
+  return normalizedLinks;
+}
+
+export async function GET() {
+  const session = await getDashboardSession();
+
+  return NextResponse.json({
+    theme: session.preferences?.theme,
+    links: session.preferences?.links ?? {},
+    expandedJobs: session.preferences?.expandedJobs,
+  });
+}
+
+export async function POST(request: Request) {
+  let body: unknown;
+
+  try {
+    body = await request.json();
+  } catch {
+    return NextResponse.json({ error: 'Invalid JSON body.' }, { status: 400 });
+  }
+
+  const payload = (body ?? {}) as Record<string, unknown>;
+  const theme = sanitizeTheme(payload.theme);
+  const expandedJobs = sanitizeExpandedJobs(payload.expandedJobs);
+  const links = sanitizeLinks(payload.links);
+
+  const hasLinks = Object.keys(links).length > 0;
+  const hasTheme = typeof theme !== 'undefined';
+  const hasExpandedJobs = typeof expandedJobs !== 'undefined';
+
+  if (!hasTheme && !hasLinks && !hasExpandedJobs) {
+    return NextResponse.json(
+      { error: 'No valid preference values provided in payload.' },
+      { status: 400 },
+    );
+  }
+
+  const session = await getDashboardSession();
+  const previousPreferences = session.preferences ?? {};
+
+  session.preferences = {
+    ...previousPreferences,
+    ...(hasTheme ? { theme } : {}),
+    ...(hasExpandedJobs ? { expandedJobs } : {}),
+    ...(hasLinks ? { links: { ...previousPreferences.links, ...links } } : {}),
+  };
+
+  await session.save();
+
+  return NextResponse.json({
+    ok: true,
+    preferences: session.preferences,
+  });
+}

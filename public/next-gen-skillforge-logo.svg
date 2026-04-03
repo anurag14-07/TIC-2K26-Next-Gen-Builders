@@ -1,0 +1,29 @@
+<svg width="512" height="352" viewBox="0 0 512 352" fill="none" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="title desc">
+  <title id="title">Next-Gen Skillforge logo</title>
+  <desc id="desc">A connected abstract mark with four quadrants and terminal nodes.</desc>
+  <rect width="512" height="352" fill="transparent"/>
+
+  <g stroke="#1f1f1f" stroke-width="10" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M116 150H180" />
+    <path d="M315 150H384" />
+    <path d="M216 256V206" />
+    <path d="M256 176L196 216" />
+    <path d="M255 176L316 116" />
+    <path d="M220 152L256 176" />
+    <path d="M256 176L292 200" />
+    <path d="M180 256L236 200" />
+    <path d="M292 200L332 160" />
+  </g>
+
+  <circle cx="84" cy="150" r="19" fill="#1f1f1f" />
+  <circle cx="426" cy="150" r="19" fill="#1f1f1f" />
+  <circle cx="216" cy="256" r="15" fill="#1f1f1f" />
+
+  <rect x="176" y="74" width="96" height="96" rx="12" fill="#1f1f1f" />
+  <rect x="300" y="64" width="98" height="98" rx="12" fill="#ffffff" stroke="#1f1f1f" stroke-width="10" />
+  <rect x="88" y="190" width="98" height="98" rx="12" fill="#ffffff" stroke="#1f1f1f" stroke-width="10" />
+  <rect x="244" y="214" width="98" height="98" rx="12" fill="#1f1f1f" />
+
+  <path d="M328 94L356 113L328 132" stroke="#1f1f1f" stroke-width="12" stroke-linecap="round" stroke-linejoin="round" />
+  <path d="M150 253L122 233L150 214" stroke="#1f1f1f" stroke-width="12" stroke-linecap="round" stroke-linejoin="round" />
+</svg>

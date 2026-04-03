@@ -61,6 +61,7 @@ export default function HomePage() {
   const [expandedJobs, setExpandedJobs] = useState(false);
   const [theme, setTheme] = useState<ThemeMode>('light');
   const [themeTransition, setThemeTransition] = useState<ThemeTransition>(null);
+  const [preferencesLoaded, setPreferencesLoaded] = useState(false);
 
   const jobsToShow = useMemo(
     () => mockUserProfile.jobRecommendations.slice(0, expandedJobs ? 5 : 3),
@@ -82,21 +83,90 @@ export default function HomePage() {
   };
 
   useEffect(() => {
-    const savedTheme = window.localStorage.getItem('theme-mode');
-    if (savedTheme === 'dark' || savedTheme === 'light') {
-      setTheme(savedTheme);
-      return;
-    }
+    let ignore = false;
 
-    if (window.matchMedia('(prefers-color-scheme: dark)').matches) {
-      setTheme('dark');
-    }
+    const loadPreferences = async () => {
+      try {
+        const response = await fetch('/api/session/preferences', { cache: 'no-store' });
+
+        if (!response.ok) {
+          throw new Error('Unable to fetch preferences from session API.');
+        }
+
+        const payload = (await response.json()) as {
+          theme?: ThemeMode;
+          links?: Partial<SocialLinks>;
+          expandedJobs?: boolean;
+        };
+
+        if (ignore) {
+          return;
+        }
+
+        if (payload.theme === 'dark' || payload.theme === 'light') {
+          setTheme(payload.theme);
+        }
+
+        if (typeof payload.expandedJobs === 'boolean') {
+          setExpandedJobs(payload.expandedJobs);
+        }
+
+        if (payload.links && typeof payload.links === 'object') {
+          setLinks((previous) => ({ ...previous, ...payload.links }));
+        }
+      } catch {
+        const savedTheme = window.localStorage.getItem('theme-mode');
+
+        if (savedTheme === 'dark' || savedTheme === 'light') {
+          setTheme(savedTheme);
+        } else if (window.matchMedia('(prefers-color-scheme: dark)').matches) {
+          setTheme('dark');
+        }
+      } finally {
+        if (!ignore) {
+          setPreferencesLoaded(true);
+        }
+      }
+    };
+
+    void loadPreferences();
+
+    return () => {
+      ignore = true;
+    };
   }, []);
 
   useEffect(() => {
     document.documentElement.dataset.theme = theme;
     window.localStorage.setItem('theme-mode', theme);
   }, [theme]);
+
+  useEffect(() => {
+    if (!preferencesLoaded) {
+      return;
+    }
+
+    const requestController = new AbortController();
+    const saveTimer = window.setTimeout(() => {
+      void fetch('/api/session/preferences', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          theme,
+          links,
+          expandedJobs,
+        }),
+        signal: requestController.signal,
+      });
+    }, 250);
+
+    return () => {
+      requestController.abort();
+      window.clearTimeout(saveTimer);
+    };
+  }, [theme, links, expandedJobs, preferencesLoaded]);
 
   const handleThemeToggle = () => {
     if (theme === 'dark') {
@@ -186,7 +256,34 @@ export default function HomePage() {
       </AnimatePresence>
 
       <main className="mx-auto flex min-h-screen w-full max-w-7xl flex-col gap-8 px-4 py-4 sm:px-8 lg:gap-10 lg:py-8">
-        <nav className="glass-panel sticky top-3 z-40 flex items-center gap-3 overflow-x-auto rounded-2xl px-3 py-2 sm:gap-4 sm:px-4">
+        <nav className="glass-panel sticky top-3 z-40 flex items-center gap-3 rounded-2xl px-3 py-2 sm:gap-4 sm:px-4">
+          <a
+            href="#overview"
+            className="inline-flex shrink-0 items-center gap-3 rounded-2xl px-1 py-1 transition hover:bg-white/50"
+            aria-label="Go to Next-Gen Skillforge overview"
+          >
+            <img
+              src="/next-gen-skillforge-logo.svg"
+              alt="Next-Gen Skillforge logo"
+              className="h-11 w-auto shrink-0"
+            />
+            <span className="flex flex-col leading-tight">
+              <span className="text-sm font-semibold text-slate-900 sm:text-base">Next-Gen Skillforge</span>
+            </span>
+          </a>
+
+          <div className="flex min-w-0 flex-1 items-center gap-2 overflow-x-auto sm:gap-3">
+            {navSections.map((section) => (
+              <a
+                key={section.id}
+                href={`#${section.id}`}
+                className="shrink-0 rounded-lg px-2.5 py-1.5 text-xs font-semibold uppercase tracking-wide text-slate-700 transition hover:bg-white/70 hover:text-emerald-800"
+              >
+                {section.label}
+              </a>
+            ))}
+          </div>
+
           <button
             type="button"
             onClick={handleThemeToggle}
@@ -196,15 +293,6 @@ export default function HomePage() {
             {theme === 'light' ? <Moon className="h-4 w-4" /> : <Sun className="h-4 w-4" />}
             {theme === 'light' ? 'Dark' : 'Light'}
           </button>
-          {navSections.map((section) => (
-            <a
-              key={section.id}
-              href={`#${section.id}`}
-              className="shrink-0 rounded-lg px-2.5 py-1.5 text-xs font-semibold uppercase tracking-wide text-slate-700 transition hover:bg-white/70 hover:text-emerald-800"
-            >
-              {section.label}
-            </a>
-          ))}
         </nav>
 
       <motion.section
