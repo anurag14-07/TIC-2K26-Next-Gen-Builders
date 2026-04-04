@@ -10,6 +10,18 @@ export interface AIDetectedSkill {
   source: string;
 }
 
+export interface AIJobRecommendation {
+  title: string;
+  company: string;
+  type: 'Full-time' | 'Internship (Paid)' | 'Internship (Unpaid)' | 'Contract';
+  salary?: string;
+  location: string;
+  skills: string[];
+  description: string;
+  matchPercentage: number;
+  fitReason: string;
+}
+
 export interface AIProfileAnalysis {
   technicalSkills: AIDetectedSkill[];
   softSkills: AIDetectedSkill[];
@@ -17,6 +29,7 @@ export interface AIProfileAnalysis {
   strengths: string[];
   gaps: string[];
   recommendations: string[];
+  jobRecommendations: AIJobRecommendation[];
   industryRelevanceScore: number;
   industryInsights: string;
   topSkills: string[];
@@ -194,14 +207,27 @@ async function callHuggingFace(prompt: string): Promise<string> {
   const token = process.env.HF_API_TOKEN;
   if (!token) throw new Error('HF_API_TOKEN missing');
 
-  const model = process.env.HF_MODEL || 'gpt2';
+  // Use a modern instruction-tuned model instead of GPT-2 (from 2019)
+  // Mistral-7B-Instruct can follow JSON instructions reliably
+  const model = process.env.HF_MODEL || 'mistralai/Mistral-7B-Instruct-v0.1';
+
+  // Wrap prompt with instruction tags that modern models expect
+  const formattedPrompt = `[INST] ${prompt} [/INST]`;
+
   const response = await fetch(`https://api-inference.huggingface.co/models/${model}`, {
     method: 'POST',
     headers: {
       Authorization: `Bearer ${token}`,
       'Content-Type': 'application/json',
     },
-    body: JSON.stringify({ inputs: prompt, parameters: { max_new_tokens: 900, temperature: 0.05 } }),
+    body: JSON.stringify({
+      inputs: formattedPrompt,
+      parameters: {
+        max_new_tokens: 1200, // Slightly higher for complex JSON with job recommendations
+        temperature: 0.05,
+        return_full_text: false, // Critical: don't return the original prompt in the response
+      },
+    }),
   });
 
   if (!response.ok) {
@@ -210,9 +236,23 @@ async function callHuggingFace(prompt: string): Promise<string> {
   }
 
   const data = await response.json();
-  if (Array.isArray(data) && data[0]?.generated_text) return data[0].generated_text;
-  if (data.generated_text) return data.generated_text;
-  return '';
+
+  // Extract the generated text (handles both array and object responses)
+  let generatedText = '';
+  if (Array.isArray(data) && data[0]?.generated_text) {
+    generatedText = data[0].generated_text;
+  } else if (data.generated_text) {
+    generatedText = data.generated_text;
+  }
+
+  // Strip the instruction tags from the response if they're included
+  // This handles cases where the model echoes back the tags
+  const cleanedText = generatedText
+    .replace(/^\[INST\]\s*/, '')
+    .replace(/\s*\[\/INST\]\s*/, '')
+    .trim();
+
+  return cleanedText;
 }
 
 export async function callModel(prompt: string): Promise<string> {
@@ -264,7 +304,20 @@ export async function analyzeProfileText(rawText: string): Promise<AIProfileAnal
   "softSkills": [{"name":"string","confidence":0.0,"score":0,"source":"string"}],
   "summary":"string",
   "gaps":["string"],
-  "recommendations":["string"]
+  "recommendations":["string"],
+  "jobRecommendations": [
+    {
+      "title":"string",
+      "company":"string",
+      "type":"Full-time|Internship (Paid)|Internship (Unpaid)|Contract",
+      "salary":"string or null",
+      "location":"string",
+      "skills":["string"],
+      "description":"string",
+      "matchPercentage":80,
+      "fitReason":"string"
+    }
+  ]
 }
 
 Rules:
@@ -272,6 +325,12 @@ Rules:
 - Do not include any extra keys or commentary.
 - confidence must be between 0 and 1.
 - score must be between 0 and 100.
+- Generate 5-8 job recommendations based on the user's specific skills and experience level.
+- Include a mix of full-time roles, paid internships, and unpaid internships.
+- Tailor all job recommendations to match the user's actual skills detected in their profile.
+- matchPercentage should reflect how well the job aligns with the user's skills (0-100).
+- location can be "Remote", "Hybrid", or a specific city.
+- salary should be a realistic range or null for internships.
 
 Profile text:
 ${rawText}`;
@@ -290,11 +349,29 @@ ${rawText}`;
   let summary = '';
   let gaps: string[] = [];
   let recommendations: string[] = [];
+  let jobRecommendations: AIJobRecommendation[] = [];
 
   if (parsed) {
     summary = typeof parsed.summary === 'string' ? parsed.summary : '';
     gaps = Array.isArray(parsed.gaps) ? parsed.gaps.slice(0, 6).map(String) : [];
     recommendations = Array.isArray(parsed.recommendations) ? parsed.recommendations.slice(0, 6).map(String) : [];
+    
+    if (Array.isArray(parsed.jobRecommendations)) {
+      jobRecommendations = parsed.jobRecommendations
+        .slice(0, 8)
+        .map((job: any, index: number) => ({
+          title: typeof job.title === 'string' ? job.title : `Position ${index + 1}`,
+          company: typeof job.company === 'string' ? job.company : 'Company',
+          type: ['Full-time', 'Internship (Paid)', 'Internship (Unpaid)', 'Contract'].includes(job.type) ? job.type : 'Full-time',
+          salary: job.salary ? String(job.salary) : undefined,
+          location: typeof job.location === 'string' ? job.location : 'Remote',
+          skills: Array.isArray(job.skills) ? job.skills.map(String).slice(0, 5) : [],
+          description: typeof job.description === 'string' ? job.description : '',
+          matchPercentage: Math.min(100, Math.max(0, Number(job.matchPercentage) || 50)),
+          fitReason: typeof job.fitReason === 'string' ? job.fitReason : 'Good match for your skills',
+        }))
+        .filter((job: any) => job.title && job.company);
+    }
   } else {
     summary = aiResponse.slice(0, 600);
   }
@@ -319,6 +396,7 @@ ${rawText}`;
     strengths: topSkills.slice(0, 5).map((skill) => `Strong signal in ${skill}`),
     gaps,
     recommendations,
+    jobRecommendations,
     industryRelevanceScore,
     industryInsights,
     topSkills,

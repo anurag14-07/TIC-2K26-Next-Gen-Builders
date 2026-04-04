@@ -24,7 +24,7 @@ import {
   ResponsiveContainer,
   Tooltip,
 } from 'recharts';
-import { mockUserProfile } from '@/lib/mockData';
+import { createEmptyUserProfile } from '@/lib/profileDefaults';
 import { cn } from '@/lib/utils';
 import type { JobRecommendation, LearningPathItem, LearningResource, SocialLinks, SkillData, UserProfile } from '@/lib/types';
 
@@ -65,6 +65,7 @@ const navSections = [
 ];
 
 export default function HomePage() {
+  const initialProfile = createEmptyUserProfile();
   const [links, setLinks] = useState<SocialLinks>({
     github: '',
     linkedin: '',
@@ -79,29 +80,29 @@ export default function HomePage() {
   const [themeTransition, setThemeTransition] = useState<ThemeTransition>(null);
   const [preferencesLoaded, setPreferencesLoaded] = useState(false);
   const [extractedSkills, setExtractedSkills] = useState<Skill[]>([]);
-  const [aiSummary, setAiSummary] = useState<string>(mockUserProfile.aiSummary.overview);
-  const [aiGaps, setAiGaps] = useState<string[]>(mockUserProfile.aiSummary.gaps);
-  const [aiStrengths, setAiStrengths] = useState<string[]>(mockUserProfile.aiSummary.strengths);
-  const [aiTechnicalSkills, setAiTechnicalSkills] = useState<SkillData[]>(mockUserProfile.technicalSkills);
-  const [aiSoftSkills, setAiSoftSkills] = useState<SkillData[]>(mockUserProfile.softSkills);
+  const [aiSummary, setAiSummary] = useState<string>(initialProfile.aiSummary.overview);
+  const [aiGaps, setAiGaps] = useState<string[]>(initialProfile.aiSummary.gaps);
+  const [aiStrengths, setAiStrengths] = useState<string[]>(initialProfile.aiSummary.strengths);
+  const [aiTechnicalSkills, setAiTechnicalSkills] = useState<SkillData[]>(initialProfile.technicalSkills);
+  const [aiSoftSkills, setAiSoftSkills] = useState<SkillData[]>(initialProfile.softSkills);
   const [analyzing, setAnalyzing] = useState(false);
   const [analysisError, setAnalysisError] = useState<string | null>(null);
   const [analysisMessage, setAnalysisMessage] = useState<string | null>(null);
 
-  const [jobs, setJobs] = useState<JobRecommendation[]>(mockUserProfile.jobRecommendations);
-  const [learningPath, setLearningPath] = useState<LearningPathItem[]>(mockUserProfile.learningPath);
-  const [industryRelevanceScore, setIndustryRelevanceScore] = useState(mockUserProfile.aiSummary.industryRelevanceScore);
-  const [industryInsights, setIndustryInsights] = useState(mockUserProfile.aiSummary.industryInsights);
-  const [topSkills, setTopSkills] = useState(mockUserProfile.aiSummary.topSkills);
+  const [jobs, setJobs] = useState<JobRecommendation[]>(initialProfile.jobRecommendations);
+  const [learningPath, setLearningPath] = useState<LearningPathItem[]>(initialProfile.learningPath);
+  const [industryRelevanceScore, setIndustryRelevanceScore] = useState(initialProfile.aiSummary.industryRelevanceScore);
+  const [industryInsights, setIndustryInsights] = useState(initialProfile.aiSummary.industryInsights);
+  const [topSkills, setTopSkills] = useState(initialProfile.aiSummary.topSkills);
 
   const jobsToShow = useMemo(
     () => jobs.slice(0, expandedJobs ? 5 : 3),
     [expandedJobs, jobs],
   );
 
-  const technicalSkillsData = aiTechnicalSkills;
+  const technicalSkillsData = useMemo(() => aiTechnicalSkills.slice(0, 6), [aiTechnicalSkills]);
 
-  const softSkillsData = aiSoftSkills;
+  const softSkillsData = useMemo(() => aiSoftSkills.slice(0, 6), [aiSoftSkills]);
 
   const averageTechnical = useMemo(() => {
     const total = technicalSkillsData.reduce((sum, item) => sum + item.value, 0);
@@ -127,16 +128,16 @@ export default function HomePage() {
     setLinks((prev) => ({ ...prev, [field]: value }));
     void fetch('/api/session/analysis', { method: 'DELETE' });
     setExtractedSkills([]);
-    setAiSummary(mockUserProfile.aiSummary.overview);
-    setAiGaps(mockUserProfile.aiSummary.gaps);
-    setAiStrengths(mockUserProfile.aiSummary.strengths);
-    setAiTechnicalSkills(mockUserProfile.technicalSkills);
-    setAiSoftSkills(mockUserProfile.softSkills);
-    setJobs(mockUserProfile.jobRecommendations);
-    setLearningPath(mockUserProfile.learningPath);
-    setIndustryRelevanceScore(mockUserProfile.aiSummary.industryRelevanceScore);
-    setIndustryInsights(mockUserProfile.aiSummary.industryInsights);
-    setTopSkills(mockUserProfile.aiSummary.topSkills);
+    setAiSummary(initialProfile.aiSummary.overview);
+    setAiGaps(initialProfile.aiSummary.gaps);
+    setAiStrengths(initialProfile.aiSummary.strengths);
+    setAiTechnicalSkills(initialProfile.technicalSkills);
+    setAiSoftSkills(initialProfile.softSkills);
+    setJobs(initialProfile.jobRecommendations);
+    setLearningPath(initialProfile.learningPath);
+    setIndustryRelevanceScore(initialProfile.aiSummary.industryRelevanceScore);
+    setIndustryInsights(initialProfile.aiSummary.industryInsights);
+    setTopSkills(initialProfile.aiSummary.topSkills);
     setAnalysisMessage('Edit completed links, then click Analyze Profile to refresh recommendations for the new user.');
     if (!isUrlValid(value)) {
       setLinkErrors((prev) => ({ ...prev, [field]: 'Please enter a valid URL (https://...).'}));
@@ -228,8 +229,17 @@ export default function HomePage() {
       } else {
         setAnalysisMessage('AI analysis completed, but no skills were detected from the provided links. Saved for this browser session.');
       }
-    } catch (err) {
-      setAnalysisError('Failed to analyze profile. Please try again.');
+    } catch (err: any) {
+      // Handle link verification errors
+      if (err.response?.status === 400 && err.response?.data?.details) {
+        const details = err.response.data.details as Array<{ source: string; url: string; reason: string }>;
+        const errorList = details.map((d) => `${d.source}: ${d.reason}`).join('\n');
+        setAnalysisError(`Link verification failed:\n\n${errorList}\n\nPlease check the links and try again.`);
+      } else if (err.response?.data?.error) {
+        setAnalysisError(err.response.data.error);
+      } else {
+        setAnalysisError('Failed to analyze profile. Please try again.');
+      }
       console.error(err);
     } finally {
       setAnalyzing(false);

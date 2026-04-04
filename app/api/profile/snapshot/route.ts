@@ -22,7 +22,7 @@ function sanitizeProfile(input: unknown): UserProfile | null {
 
 function toTsModule(profile: UserProfile): string {
   const serialized = JSON.stringify(profile, null, 2);
-  return `import type { UserProfile } from './types';\n\nexport const mockUserProfile: UserProfile = ${serialized};\n`;
+  return `import type { UserProfile } from './types';\n\nexport const generatedUserProfile: UserProfile = ${serialized};\n`;
 }
 
 export async function POST(request: Request) {
@@ -43,17 +43,17 @@ export async function POST(request: Request) {
 
   const workspaceRoot = process.cwd();
   const libDir = path.join(workspaceRoot, 'lib');
-  const mockDataPath = path.join(libDir, 'mockData.ts');
+  const generatedProfilePath = path.join(libDir, 'generatedUserProfile.ts');
   const jsonFallbackPath = path.join(libDir, 'generatedUserProfile.json');
 
   try {
     await mkdir(libDir, { recursive: true });
-    await writeFile(mockDataPath, toTsModule(profile), 'utf8');
+    await writeFile(generatedProfilePath, toTsModule(profile), 'utf8');
 
     return NextResponse.json({
       ok: true,
       format: 'ts',
-      path: 'lib/mockData.ts',
+      path: 'lib/generatedUserProfile.ts',
     });
   } catch (writeError) {
     try {

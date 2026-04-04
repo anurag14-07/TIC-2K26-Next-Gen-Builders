@@ -1,3 +1,5 @@
+import axios from 'axios';
+import * as cheerio from 'cheerio';
 import { NextRequest, NextResponse } from 'next/server';
 import { analyzeProfileText } from '@/lib/ai';
 import type { JobRecommendation, LearningPathItem, LearningResource } from '@/lib/types';
@@ -16,6 +18,22 @@ interface Skill {
   confidence: number;
   source: string;
 }
+
+interface ScrapedSource {
+  source: string;
+  url: string;
+  title: string;
+  description: string;
+  text: string;
+  skills: Skill[];
+}
+
+const SCRAPER_HEADERS = {
+  'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+  Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+};
+
+const SCRAPE_TIMEOUT_MS = 12000;
 
 const BASE_SKILL_KEYWORDS = [
   'react',
@@ -36,9 +54,72 @@ const BASE_SKILL_KEYWORDS = [
   'kubernetes',
   'sql',
   'aws',
+  'mongodb',
+  'postgresql',
+  'firebase',
+  'git',
+  'rest',
+  'api',
+  'testing',
+  'jest',
+  'webpack',
+  'vite',
+  'redux',
+  'fastapi',
+  'django',
+  'flask',
+  'rust',
+  'go',
+  'kotlin',
+  'swift',
+  'ci/cd',
+  'devops',
+  'cloud',
+  'microservices',
 ];
 
 const SOFT_SKILL_HINTS = ['communication', 'leadership', 'teamwork', 'problem solving', 'adaptability', 'creativity', 'ownership', 'presentation', 'mentoring'];
+
+interface SkillFrequency {
+  skill: string;
+  count: number;
+  sources: Set<string>;
+}
+
+function buildSkillFrequencyMap(allText: string): Map<string, SkillFrequency> {
+  const frequencyMap = new Map<string, SkillFrequency>();
+  const lowerText = allText.toLowerCase();
+
+  for (const keyword of BASE_SKILL_KEYWORDS) {
+    const regex = new RegExp(`\\b${keyword}\\b`, 'gi');
+    const matches = lowerText.match(regex);
+    const count = matches ? matches.length : 0;
+
+    if (count > 0) {
+      const normalizedName = normalizeSkill(keyword);
+      frequencyMap.set(normalizedName.toLowerCase(), {
+        skill: normalizedName,
+        count,
+        sources: new Set(),
+      });
+    }
+  }
+
+  return frequencyMap;
+}
+
+function calculateFrequencyScore(frequency: SkillFrequency, maxCount: number): number {
+  if (maxCount === 0) return 50;
+
+  const relativeFrequency = frequency.count / maxCount;
+
+  if (relativeFrequency >= 0.6) return 90 + Math.random() * 8;
+  if (relativeFrequency >= 0.4) return 75 + Math.random() * 12;
+  if (relativeFrequency >= 0.2) return 60 + Math.random() * 12;
+  if (relativeFrequency >= 0.1) return 50 + Math.random() * 10;
+
+  return Math.max(40, 45 + relativeFrequency * 5);
+}
 
 function normalizeSkill(keyword: string) {
   return keyword
@@ -52,6 +133,15 @@ function normalizeSkill(keyword: string) {
 }
 
 function extractSkillsFromText(text: string, source: string): Skill[] {
+  const SOURCE_BASE_CONFIDENCE: Record<string, number> = {
+    'GitHub': 0.75,
+    'LinkedIn': 0.70,
+    'Portfolio': 0.75,
+    'Dev.to': 0.65,
+    'Resume': 0.70,
+    'Twitter': 0.55,
+  };
+
   const skills: Skill[] = [];
   const lowered = text.toLowerCase();
   const found = new Set<string>();
@@ -62,10 +152,12 @@ function extractSkillsFromText(text: string, source: string): Skill[] {
     }
   });
 
+  const baseConfidence = SOURCE_BASE_CONFIDENCE[source] || 0.65;
+
   found.forEach((keyword) => {
     skills.push({
       name: normalizeSkill(keyword),
-      confidence: 0.6,
+      confidence: baseConfidence,
       source,
     });
   });
@@ -73,7 +165,165 @@ function extractSkillsFromText(text: string, source: string): Skill[] {
   return skills;
 }
 
-function buildProfileText(links: SocialLinks, extractedSkills: Skill[]): string {
+function aggregateSkillsByNameWithBoost(skills: Skill[]): Skill[] {
+  const SOURCE_CREDIBILITY_SCORE: Record<string, number> = {
+    'GitHub': 0.95,
+    'LinkedIn': 0.85,
+    'Portfolio': 0.90,
+    'Dev.to': 0.80,
+    'Resume': 0.88,
+    'Twitter': 0.60,
+  };
+
+  const skillMap = new Map<string, { name: string; sources: Set<string>; confidences: number[] }>();
+
+  for (const skill of skills) {
+    const key = normalizeToken(skill.name);
+    if (!skillMap.has(key)) {
+      skillMap.set(key, {
+        name: skill.name,
+        sources: new Set(),
+        confidences: [],
+      });
+    }
+
+    const entry = skillMap.get(key)!;
+    entry.sources.add(skill.source);
+    entry.confidences.push(skill.confidence);
+  }
+
+  return Array.from(skillMap.values()).map((entry) => {
+    const sourcesArray = Array.from(entry.sources);
+    const sourceCredibilities = sourcesArray.map((s) => SOURCE_CREDIBILITY_SCORE[s] || 0.70);
+    const avgSourceCredibility = sourceCredibilities.reduce((a, b) => a + b, 0) / sourceCredibilities.length;
+    const maxConfidence = Math.max(...entry.confidences);
+    const countBonus = Math.min(0.25, (entry.sources.size - 1) * 0.05);
+
+    const finalConfidence = Math.min(0.99, maxConfidence + (avgSourceCredibility - 0.6) * 0.2 + countBonus);
+
+    return {
+      name: entry.name,
+      confidence: finalConfidence,
+      source: sourcesArray.join(' + '),
+    };
+  });
+}
+
+function cleanText(value: string | null | undefined): string {
+  return value ? value.replace(/\s+/g, ' ').trim() : '';
+}
+
+function truncateText(value: string, maxLength = 3200): string {
+  const normalized = cleanText(value);
+  if (normalized.length <= maxLength) return normalized;
+  return `${normalized.slice(0, maxLength)}…`;
+}
+
+function normalizeUrl(value: string): string {
+  try {
+    const parsed = new URL(value);
+    parsed.hash = '';
+    return parsed.toString();
+  } catch {
+    return value.trim();
+  }
+}
+
+function buildUrlList(links: SocialLinks): string[] {
+  return Object.values(links)
+    .filter((value): value is string => typeof value === 'string' && value.trim().length > 0)
+    .map((value) => normalizeUrl(value));
+}
+
+interface LinkVerificationResult {
+  url: string;
+  source: keyof SocialLinks;
+  accessible: boolean;
+  status?: number;
+  error?: string;
+}
+
+async function verifyLinks(links: SocialLinks): Promise<{
+  verified: LinkVerificationResult[];
+  accessibleCount: number;
+  inaccessibleLinks: LinkVerificationResult[];
+}> {
+  const results: LinkVerificationResult[] = [];
+
+  const sourceNames = Object.entries(links)
+    .filter(([, url]) => typeof url === 'string' && url.trim().length > 0)
+    .map(([key, url]) => [key as keyof SocialLinks, normalizeUrl(url)] as const);
+
+  const verificationPromises = sourceNames.map(async ([source, url]) => {
+    try {
+      const response = await axios.head(url, {
+        headers: SCRAPER_HEADERS,
+        timeout: 6000,
+        validateStatus: () => true,
+        maxRedirects: 5,
+      });
+
+      const accessible = response.status >= 200 && response.status < 400;
+      const result: LinkVerificationResult = {
+        url,
+        source,
+        accessible,
+        status: response.status,
+      };
+
+      if (!accessible) {
+        result.error = `HTTP ${response.status}: ${getStatusDescription(response.status)}`;
+      }
+
+      return result;
+    } catch (error) {
+      const errorMsg = error instanceof Error ? error.message : 'Unknown error';
+      return {
+        url,
+        source,
+        accessible: false,
+        error: `Connection failed: ${errorMsg.includes('timeout') ? 'Request timeout' : 'Unable to reach'}`,
+      };
+    }
+  });
+
+  const allResults = await Promise.all(verificationPromises);
+
+  const accessibleCount = allResults.filter((r) => r.accessible).length;
+  const inaccessibleLinks = allResults.filter((r) => !r.accessible);
+
+  return {
+    verified: allResults,
+    accessibleCount,
+    inaccessibleLinks,
+  };
+}
+
+function getStatusDescription(status: number): string {
+  const descriptions: Record<number, string> = {
+    400: 'Bad Request',
+    401: 'Unauthorized (Login Required)',
+    403: 'Forbidden (Access Denied)',
+    404: 'Not Found',
+    410: 'Gone (Permanently Deleted)',
+    429: 'Too Many Requests (Rate Limited)',
+    500: 'Server Error',
+    503: 'Service Unavailable',
+  };
+
+  return descriptions[status] || 'Inaccessible';
+}
+
+function extractTextBlock($: cheerio.CheerioAPI, selector: string, limit = 8): string {
+  return $(selector)
+    .toArray()
+    .slice(0, limit)
+    .map((element) => cleanText($(element).text()))
+    .filter(Boolean)
+    .join('\n');
+}
+
+function buildProfileText(links: SocialLinks, sources: ScrapedSource[], extractedSkills: Skill[]): string {
   const lines: string[] = [];
 
   for (const [key, value] of Object.entries(links)) {
@@ -82,11 +332,320 @@ function buildProfileText(links: SocialLinks, extractedSkills: Skill[]): string 
     }
   }
 
+  for (const source of sources) {
+    lines.push(`source: ${source.source}`);
+    lines.push(`title: ${source.title}`);
+
+    if (source.description) {
+      lines.push(`description: ${source.description}`);
+    }
+
+    if (source.text) {
+      lines.push(source.text);
+    }
+  }
+
   if (extractedSkills.length > 0) {
     lines.push(`detectedSkills: ${extractedSkills.map((skill) => `${skill.name} (${skill.source})`).join(', ')}`);
   }
 
-  return lines.length > 0 ? lines.join('\n') : 'No profile links or detected skills available';
+  return lines.length > 0 ? truncateText(lines.join('\n\n'), 12000) : 'No profile links or detected skills available';
+}
+
+async function fetchHtml(url: string): Promise<{ html: string; finalUrl: string }> {
+  const response = await axios.get(url, {
+    headers: SCRAPER_HEADERS,
+    timeout: SCRAPE_TIMEOUT_MS,
+    responseType: 'text',
+    validateStatus: (status) => status >= 200 && status < 400,
+  });
+
+  return {
+    html: typeof response.data === 'string' ? response.data : String(response.data ?? ''),
+    finalUrl: normalizeUrl(url),
+  };
+}
+
+async function buildGenericSource(url: string, source: string): Promise<ScrapedSource> {
+  const normalizedUrl = normalizeUrl(url);
+  const { html, finalUrl } = await fetchHtml(normalizedUrl);
+  const $ = cheerio.load(html);
+
+  const title = cleanText(
+    $('meta[property="og:title"]').attr('content')
+      || $('meta[name="twitter:title"]').attr('content')
+      || $('title').first().text()
+      || source,
+  );
+  const description = cleanText(
+    $('meta[property="og:description"]').attr('content')
+      || $('meta[name="description"]').attr('content')
+      || $('meta[name="twitter:description"]').attr('content')
+      || '',
+  );
+
+  const text = truncateText(
+    [
+      title,
+      description,
+      extractTextBlock($, 'main'),
+      extractTextBlock($, 'article'),
+      extractTextBlock($, 'section'),
+      extractTextBlock($, 'h1, h2, h3, p, li'),
+    ]
+      .filter(Boolean)
+      .join('\n'),
+  );
+
+  return {
+    source,
+    url: finalUrl,
+    title: title || source,
+    description,
+    text,
+    skills: extractSkillsFromText(text, source),
+  };
+}
+
+async function scrapeGitHub(url: string): Promise<ScrapedSource> {
+  const normalizedUrl = normalizeUrl(url);
+
+  try {
+    const parsed = new URL(normalizedUrl);
+    const username = parsed.pathname.split('/').filter(Boolean)[0];
+
+    if (!username) {
+      return await buildGenericSource(normalizedUrl, 'GitHub');
+    }
+
+    const profileUrl = `https://github.com/${username}`;
+    const repositoriesUrl = `https://github.com/${username}?tab=repositories`;
+    const [profilePage, repositoriesPage] = await Promise.all([fetchHtml(profileUrl), fetchHtml(repositoriesUrl)]);
+    const profileDoc = cheerio.load(profilePage.html);
+    const repositoriesDoc = cheerio.load(repositoriesPage.html);
+
+    const title = cleanText(
+      profileDoc('meta[property="og:title"]').attr('content')
+        || profileDoc('title').first().text()
+        || `${username} on GitHub`,
+    );
+    const description = cleanText(
+      profileDoc('meta[property="og:description"]').attr('content')
+        || profileDoc('meta[name="description"]').attr('content')
+        || profileDoc('[data-testid="user-profile-bio"]').first().text()
+        || '',
+    );
+
+    const repoHighlights = repositoriesDoc('article, .Box-row, li').toArray().slice(0, 10).map((element) => {
+      const card = repositoriesDoc(element);
+      const repoName = cleanText(card.find('a').first().text());
+      const repoDescription = cleanText(card.find('p').first().text());
+      const repoLanguage = cleanText(card.find('[itemprop="programmingLanguage"]').first().text());
+
+      return [repoName, repoDescription, repoLanguage].filter(Boolean).join(' | ');
+    }).filter(Boolean);
+
+    const text = truncateText(
+      [
+        title,
+        description,
+        extractTextBlock(profileDoc, 'main'),
+        extractTextBlock(profileDoc, 'h1, h2, h3, p, li'),
+        extractTextBlock(repositoriesDoc, 'main'),
+        extractTextBlock(repositoriesDoc, 'article, .Box-row, li'),
+        repoHighlights.join('\n'),
+      ]
+        .filter(Boolean)
+        .join('\n'),
+    );
+
+    return {
+      source: 'GitHub',
+      url: profilePage.finalUrl,
+      title,
+      description,
+      text,
+      skills: extractSkillsFromText(text, 'GitHub'),
+    };
+  } catch (error) {
+    console.error('GitHub scrape failed:', error);
+    return await buildGenericSource(normalizedUrl, 'GitHub');
+  }
+}
+
+async function scrapeLinkedIn(url: string): Promise<ScrapedSource> {
+  const normalizedUrl = normalizeUrl(url);
+
+  try {
+    const { html, finalUrl } = await fetchHtml(normalizedUrl);
+    const $ = cheerio.load(html);
+
+    const title = cleanText(
+      $('meta[property="og:title"]').attr('content')
+        || $('title').first().text()
+        || 'LinkedIn profile',
+    );
+    const description = cleanText(
+      $('meta[property="og:description"]').attr('content')
+        || $('meta[name="description"]').attr('content')
+        || $('meta[name="twitter:description"]').attr('content')
+        || '',
+    );
+
+    const text = truncateText(
+      [
+        title,
+        description,
+        extractTextBlock($, 'main'),
+        extractTextBlock($, 'section'),
+        extractTextBlock($, 'article'),
+        extractTextBlock($, 'h1, h2, h3, p, li'),
+      ]
+        .filter(Boolean)
+        .join('\n'),
+    );
+
+    return {
+      source: 'LinkedIn',
+      url: finalUrl,
+      title,
+      description,
+      text,
+      skills: extractSkillsFromText(text, 'LinkedIn'),
+    };
+  } catch (error) {
+    console.error('LinkedIn scrape failed:', error);
+    return {
+      source: 'LinkedIn',
+      url: normalizedUrl,
+      title: 'LinkedIn profile',
+      description: 'Public LinkedIn content could not be fully scraped.',
+      text: normalizedUrl,
+      skills: [],
+    };
+  }
+}
+
+async function scrapePortfolio(url: string): Promise<ScrapedSource> {
+  try {
+    return await buildGenericSource(url, 'Portfolio');
+  } catch (error) {
+    console.error('Portfolio scrape failed:', error);
+    return {
+      source: 'Portfolio',
+      url: normalizeUrl(url),
+      title: 'Portfolio',
+      description: 'Portfolio content could not be scraped.',
+      text: normalizeUrl(url),
+      skills: [],
+    };
+  }
+}
+
+async function scrapeResume(url: string): Promise<ScrapedSource> {
+  try {
+    return await buildGenericSource(url, 'Resume');
+  } catch (error) {
+    console.error('Resume scrape failed:', error);
+    return {
+      source: 'Resume',
+      url: normalizeUrl(url),
+      title: 'Resume',
+      description: 'Resume content could not be scraped.',
+      text: normalizeUrl(url),
+      skills: [],
+    };
+  }
+}
+
+async function scrapeTwitter(url: string): Promise<ScrapedSource> {
+  try {
+    return await buildGenericSource(url, 'Twitter');
+  } catch (error) {
+    console.error('Twitter scrape failed:', error);
+    return {
+      source: 'Twitter',
+      url: normalizeUrl(url),
+      title: 'Twitter profile',
+      description: 'Twitter content could not be scraped.',
+      text: normalizeUrl(url),
+      skills: [],
+    };
+  }
+}
+
+async function scrapeDevTo(url: string): Promise<ScrapedSource> {
+  const normalizedUrl = normalizeUrl(url);
+
+  try {
+    const parsed = new URL(normalizedUrl);
+    const username = parsed.pathname.split('/').filter(Boolean)[0];
+
+    if (!username) {
+      return await buildGenericSource(normalizedUrl, 'Dev.to');
+    }
+
+    const profileUrl = `https://dev.to/${username}`;
+    const articlesUrl = `https://dev.to/api/articles?username=${username}`;
+    const [profilePage, articlesResponse] = await Promise.all([fetchHtml(profileUrl), axios.get(articlesUrl, { headers: SCRAPER_HEADERS, timeout: SCRAPE_TIMEOUT_MS, validateStatus: (status) => status >= 200 && status < 400 })]);
+    const doc = cheerio.load(profilePage.html);
+    const articles = Array.isArray(articlesResponse.data) ? articlesResponse.data : [];
+
+    const title = cleanText(
+      doc('meta[property="og:title"]').attr('content')
+        || doc('title').first().text()
+        || `${username} on DEV`,
+    );
+    const description = cleanText(
+      doc('meta[property="og:description"]').attr('content')
+        || doc('meta[name="description"]').attr('content')
+        || '',
+    );
+
+    const articleSummaries = articles.slice(0, 8).map((article: { title?: string; description?: string; tag_list?: string[]; reading_time_minutes?: number }) => {
+      return [article.title, article.description, Array.isArray(article.tag_list) ? article.tag_list.join(', ') : '', typeof article.reading_time_minutes === 'number' ? `${article.reading_time_minutes} min read` : '']
+        .filter(Boolean)
+        .join(' | ');
+    }).filter(Boolean);
+
+    const text = truncateText(
+      [
+        title,
+        description,
+        extractTextBlock(doc, 'main'),
+        extractTextBlock(doc, 'article'),
+        extractTextBlock(doc, 'h1, h2, h3, p, li'),
+        articleSummaries.join('\n'),
+      ]
+        .filter(Boolean)
+        .join('\n'),
+    );
+
+    return {
+      source: 'Dev.to',
+      url: profilePage.finalUrl,
+      title,
+      description,
+      text,
+      skills: extractSkillsFromText(text, 'Dev.to'),
+    };
+  } catch (error) {
+    console.error('Dev.to scrape failed:', error);
+    return await buildGenericSource(normalizedUrl, 'Dev.to');
+  }
+}
+
+async function collectScrapedSources(links: SocialLinks): Promise<ScrapedSource[]> {
+  const tasks: Array<Promise<ScrapedSource>> = [];
+
+  if (links.github) tasks.push(scrapeGitHub(links.github));
+  if (links.linkedin) tasks.push(scrapeLinkedIn(links.linkedin));
+  if (links.portfolio) tasks.push(scrapePortfolio(links.portfolio));
+  if (links.resume) tasks.push(scrapeResume(links.resume));
+  if (links.twitter) tasks.push(scrapeTwitter(links.twitter));
+  if (links.devto) tasks.push(scrapeDevTo(links.devto));
+
+  return await Promise.all(tasks);
 }
 
 function normalizeToken(value: string): string {
@@ -391,6 +950,29 @@ function clampConfidence(value: number): number {
   return Math.min(1, Math.max(0.35, value));
 }
 
+function buildIndustryInsights(
+  industryRelevanceScore: number,
+  topSkills: string[],
+  gaps: string[],
+  sources: string[],
+  technicalSkills: AnalysisResult['technicalSkills'],
+  softSkills: AnalysisResult['softSkills'],
+): string {
+  const sourcePhrase = sources.length > 0 ? formatList(sources) : 'your linked profiles';
+  const strongest = topSkills.slice(0, 3);
+  const strongestPhrase = strongest.length > 0 ? formatList(strongest) : 'core skills';
+  const gapHeadline = gaps[0] ? gaps[0] : 'add clearer project outcomes and measurable impact to strengthen role fit';
+
+  const technicalAvg = technicalSkills.length > 0
+    ? Math.round(technicalSkills.reduce((sum, skill) => sum + skill.score, 0) / technicalSkills.length)
+    : 0;
+  const softAvg = softSkills.length > 0
+    ? Math.round(softSkills.reduce((sum, skill) => sum + skill.score, 0) / softSkills.length)
+    : 0;
+
+  return `Relevance is ${industryRelevanceScore}% based on ${sourcePhrase}, with strongest evidence in ${strongestPhrase}. Technical signal averages ${technicalAvg}% and collaboration signal averages ${softAvg}%. Highest-impact next step: ${gapHeadline}`;
+}
+
 function enrichAnalysis(analysis: AnalysisResult, extractedSkills: Skill[]): AnalysisResult {
   const sources = getProfileSources(extractedSkills);
   const focusArea = detectFocusArea([...analysis.technicalSkills, ...analysis.softSkills]);
@@ -457,9 +1039,14 @@ function enrichAnalysis(analysis: AnalysisResult, extractedSkills: Skill[]): Ana
     : 0;
 
   const industryRelevanceScore = analysis.industryRelevanceScore > 0 ? analysis.industryRelevanceScore : averageScore;
-  const industryInsights = analysis.industryInsights.trim().length > 0
-    ? analysis.industryInsights
-    : `Your processed profile indicates a relevance score of ${industryRelevanceScore} based on current strengths in ${topSkills.slice(0, 3).join(', ') || 'core skills'}. Focus on the listed gaps to improve role fit.`;
+  const industryInsights = buildIndustryInsights(
+    industryRelevanceScore,
+    topSkills,
+    gaps,
+    sources,
+    technicalSkills,
+    softSkills,
+  );
 
   const strengths = buildPersonalizedStrengths({ ...analysis, technicalSkills, softSkills, topSkills }, sources, focusArea);
 
@@ -478,156 +1065,261 @@ function enrichAnalysis(analysis: AnalysisResult, extractedSkills: Skill[]): Ana
 }
 
 function buildAIStrengths(analysis: Awaited<ReturnType<typeof analyzeProfileText>>): string[] {
-  const strengths = new Set<string>();
+  const fromAnalysis = Array.isArray(analysis.strengths)
+    ? analysis.strengths.map((item) => item.trim()).filter(Boolean)
+    : [];
 
-  analysis.topSkills.slice(0, 4).forEach((skill) => strengths.add(`Strong signal in ${skill}`));
-  analysis.technicalSkills.slice(0, 2).forEach((skill) => strengths.add(`Technical strength: ${skill.name}`));
-  analysis.softSkills.slice(0, 2).forEach((skill) => strengths.add(`Soft-skill strength: ${skill.name}`));
+  if (fromAnalysis.length > 0) {
+    const normalizedSeen = new Set<string>();
+    const unique = fromAnalysis.filter((line) => {
+      const normalized = normalizeToken(line);
+      if (!normalized || normalizedSeen.has(normalized)) return false;
+      normalizedSeen.add(normalized);
+      return true;
+    });
 
-  return Array.from(strengths).slice(0, 5);
+    return unique.slice(0, 5);
+  }
+
+  const fallback = new Set<string>();
+  analysis.technicalSkills.slice(0, 3).forEach((skill) => fallback.add(`Technical depth shown in ${skill.name}.`));
+  analysis.softSkills.slice(0, 2).forEach((skill) => fallback.add(`Collaboration signal present in ${skill.name}.`));
+
+  return Array.from(fallback).slice(0, 5);
 }
 
 function buildAIJobRecommendations(analysis: Awaited<ReturnType<typeof analyzeProfileText>>): JobRecommendation[] {
+  // If AI has generated job recommendations, use those
+  if (analysis.jobRecommendations && analysis.jobRecommendations.length > 0) {
+    const mapped = analysis.jobRecommendations
+      .map((job, index) => ({
+        id: index + 1,
+        title: job.title,
+        company: job.company,
+        matchPercentage: job.matchPercentage,
+        salary: job.salary || 'Competitive',
+        location: job.location,
+        type: job.type,
+        skills: job.skills,
+        description: job.description,
+        applyUrl: '#',
+        fitReason: job.fitReason,
+      }))
+      .sort((a, b) => b.matchPercentage - a.matchPercentage)
+      .slice(0, 8);
+
+    const selected: JobRecommendation[] = [];
+    const used = new Set<string>();
+
+    const addByType = (typeMatcher: (type: string) => boolean) => {
+      const found = mapped.find((item) => typeMatcher(item.type) && !used.has(`${item.title}|${item.company}`));
+      if (found) {
+        used.add(`${found.title}|${found.company}`);
+        selected.push(found);
+      }
+    };
+
+    addByType((type) => type.toLowerCase() === 'full-time');
+    addByType((type) => type.toLowerCase().includes('internship'));
+    addByType((type) => type.toLowerCase() === 'contract');
+
+    for (const item of mapped) {
+      const key = `${item.title}|${item.company}`;
+      if (!used.has(key)) {
+        used.add(key);
+        selected.push(item);
+      }
+      if (selected.length >= 5) break;
+    }
+
+    return selected.slice(0, 5).map((item, index) => ({ ...item, id: index + 1 }));
+  }
+
+  // Fallback to deterministic skill-based recommendations if AI didn't generate any
   const skillLookup = createSkillLookup([
     ...analysis.topSkills,
     ...analysis.technicalSkills.map((skill) => skill.name),
     ...analysis.softSkills.map((skill) => skill.name),
   ]);
 
-  const matchedGapText = analysis.gaps[0] ?? 'your current profile direction';
   const topSkillsText = analysis.topSkills.slice(0, 3).join(', ') || 'your strongest signals';
-  const softSkillTokens = new Set(analysis.softSkills.map((skill) => normalizeToken(skill.name)));
   const gapTokens = createSkillLookup(analysis.gaps);
 
   const countHits = (items: string[]) => items.reduce((total, item) => total + (skillLookup.has(normalizeToken(item)) ? 1 : 0), 0);
-  const countSoftHits = (items: string[]) => items.reduce((total, item) => total + (softSkillTokens.has(normalizeToken(item)) ? 1 : 0), 0);
   const countGapHits = (items: string[]) => items.reduce((total, item) => total + (gapTokens.has(normalizeToken(item)) ? 1 : 0), 0);
+  const hasEarlyCareerSignals = analysis.technicalSkills.length < 7 || analysis.topSkills.length < 5;
 
-  const templates = [
+  const roleCatalog = [
     {
-      id: 1,
-      title: 'Product Engineer',
-      company: 'Digital Experience Co.',
-      salary: '$105K – $140K',
-      location: 'Hybrid',
-      type: 'Full-time',
-      skills: ['Communication', 'Problem Solving', 'React', 'Testing'],
-      focus: ['communication', 'problem solving', 'teamwork', 'testing', 'react', 'product', 'ownership'],
-      gapFocus: ['ownership', 'testing', 'product'],
-      description: `Strong fit for profiles with execution, ownership, and collaboration signals. Your AI analysis suggests you can translate technical depth into product-focused delivery.`,
-    },
-    {
-      id: 2,
       title: 'Frontend Engineer',
       company: 'Product Studio',
-      salary: '$110K – $145K',
+      salary: '$100K – $140K',
       location: 'Remote / Hybrid',
       type: 'Full-time',
       skills: ['React', 'TypeScript', 'Next.js', 'Accessibility'],
-      focus: ['react', 'typescript', 'next.js', 'javascript', 'ui', 'accessibility', 'design'],
-      gapFocus: ['accessibility', 'design'],
-      description: `Best for building polished interfaces, component systems, and accessible product experiences from your strongest technical signals.`,
+      signals: ['react', 'typescript', 'next.js', 'javascript', 'ui', 'css', 'frontend'],
+      gapSignals: ['testing', 'accessibility'],
+      description: 'Best for building polished, production-ready interfaces with strong component and UX quality.',
     },
     {
-      id: 3,
-      title: 'Full Stack Engineer',
-      company: 'ScaleUp Labs',
-      salary: '$120K – $160K',
+      title: 'Backend Engineer',
+      company: 'Data Driven Products',
+      salary: '$105K – $145K',
       location: 'Remote / Hybrid',
       type: 'Full-time',
-      skills: ['Node.js', 'React', 'PostgreSQL', 'AWS'],
-      focus: ['node.js', 'node', 'react', 'typescript', 'sql', 'database', 'aws', 'api', 'backend'],
-      gapFocus: ['backend', 'database', 'sql', 'api', 'aws'],
-      description: `Best when the profile shows frontend strength plus enough backend or data system signal to take ownership across the stack.`,
+      skills: ['Node.js', 'REST APIs', 'SQL', 'Testing'],
+      signals: ['node', 'node.js', 'api', 'rest', 'sql', 'database', 'backend'],
+      gapSignals: ['database', 'api', 'testing'],
+      description: 'Fit for profiles with API and service-layer signals that can be expanded into ownership of backend systems.',
     },
     {
-      id: 4,
-      title: 'Platform Engineer',
+      title: 'Full Stack Engineer',
+      company: 'ScaleUp Labs',
+      salary: '$115K – $160K',
+      location: 'Hybrid',
+      type: 'Full-time',
+      skills: ['React', 'Node.js', 'TypeScript', 'SQL'],
+      signals: ['react', 'typescript', 'node', 'api', 'sql', 'fullstack', 'next.js'],
+      gapSignals: ['system design', 'architecture'],
+      description: 'Good fit when your profile shows both frontend delivery and backend implementation potential.',
+    },
+    {
+      title: 'Cloud / DevOps Engineer',
       company: 'Cloud Native Systems',
-      salary: '$125K – $170K',
+      salary: '$115K – $165K',
       location: 'Remote',
       type: 'Full-time',
       skills: ['Docker', 'Kubernetes', 'CI/CD', 'AWS'],
-      focus: ['docker', 'kubernetes', 'aws', 'cloud', 'devops', 'ci/cd', 'cicd', 'deployment'],
-      gapFocus: ['cloud', 'devops', 'deployment', 'cicd', 'ci/cd'],
-      description: `Best for profiles that need more cloud delivery, automation, and infrastructure ownership.`,
+      signals: ['docker', 'kubernetes', 'cloud', 'aws', 'devops', 'ci/cd', 'deployment'],
+      gapSignals: ['cloud', 'devops', 'ci/cd'],
+      description: 'Strong track when your signals include deployment, cloud tooling, or automation practices.',
     },
     {
-      id: 5,
-      title: 'Backend / API Engineer',
-      company: 'Data Driven Products',
-      salary: '$115K – $155K',
-      location: 'Remote / Hybrid',
-      type: 'Full-time',
-      skills: ['Node.js', 'REST APIs', 'SQL', 'GraphQL'],
-      focus: ['node.js', 'node', 'sql', 'database', 'graphql', 'api', 'backend'],
-      gapFocus: ['api', 'backend', 'database', 'sql', 'graphql'],
-      description: `Useful when your profile shows strong delivery and a need to deepen API, database, or backend ownership.`,
-    },
-    {
-      id: 6,
-      title: 'Developer Experience Engineer',
-      company: 'Toolchain Studio',
-      salary: '$115K – $150K',
+      title: 'AI/ML Engineer Intern',
+      company: 'Applied Intelligence Lab',
+      salary: '$25 – $40 / hour',
       location: 'Remote',
-      type: 'Full-time',
-      skills: ['Communication', 'Mentoring', 'React', 'Testing'],
-      focus: ['communication', 'mentoring', 'presentation', 'teamwork', 'testing', 'developer experience', 'docs'],
-      gapFocus: ['communication', 'mentoring', 'testing', 'docs'],
-      description: `Best for profiles that combine technical fluency with communication and mentoring strength, especially when building internal tools or developer-facing products.`,
+      type: 'Internship (Paid)',
+      skills: ['Python', 'Data Processing', 'APIs', 'Git'],
+      signals: ['python', 'api', 'data', 'ml', 'ai', 'automation'],
+      gapSignals: ['python', 'data'],
+      description: 'Paid internship focused on practical model integration, data workflows, and engineering quality.',
+    },
+    {
+      title: 'Frontend Developer Intern',
+      company: 'Experience Design Collective',
+      salary: '$18 – $28 / hour',
+      location: 'Hybrid',
+      type: 'Internship (Paid)',
+      skills: ['React', 'JavaScript', 'CSS', 'Git'],
+      signals: ['react', 'javascript', 'css', 'html', 'ui', 'frontend'],
+      gapSignals: ['accessibility', 'testing'],
+      description: 'Paid internship that turns strong UI foundations into measurable product-delivery outcomes.',
+    },
+    {
+      title: 'Open Source Contributor Intern',
+      company: 'Tech for Good Foundation',
+      salary: 'Stipend / Unpaid',
+      location: 'Remote',
+      type: 'Internship (Unpaid)',
+      skills: ['Git', 'Issue Triage', 'Documentation', 'Testing'],
+      signals: ['git', 'github', 'testing', 'docs', 'communication'],
+      gapSignals: ['communication', 'testing'],
+      description: 'Unpaid internship designed for portfolio growth through shipped OSS contributions and maintainership practices.',
+    },
+    {
+      title: 'Community Product Intern',
+      company: 'Startup Incubator Network',
+      salary: 'Unpaid (Certificate + Mentorship)',
+      location: 'Remote / Hybrid',
+      type: 'Internship (Unpaid)',
+      skills: ['Communication', 'Research', 'Prototyping', 'Teamwork'],
+      signals: ['communication', 'presentation', 'teamwork', 'ownership', 'product'],
+      gapSignals: ['ownership', 'product'],
+      description: 'Role emphasizes product storytelling, collaboration, and fast prototyping in startup environments.',
+    },
+    {
+      title: 'Contract Frontend Developer',
+      company: 'Freelance Product Team',
+      salary: '$45 – $70 / hour',
+      location: 'Remote',
+      type: 'Contract',
+      skills: ['React', 'Next.js', 'TypeScript', 'Performance'],
+      signals: ['react', 'next.js', 'typescript', 'performance', 'ui'],
+      gapSignals: ['testing', 'accessibility'],
+      description: 'Contract role suited for shipping feature sprints and improving frontend performance in short cycles.',
+    },
+    {
+      title: 'Contract API Developer',
+      company: 'Integration Partners',
+      salary: '$50 – $80 / hour',
+      location: 'Remote',
+      type: 'Contract',
+      skills: ['Node.js', 'REST', 'Database', 'Cloud'],
+      signals: ['node', 'api', 'rest', 'database', 'cloud'],
+      gapSignals: ['api', 'database', 'cloud'],
+      description: 'Contract role focused on integrations, API reliability, and production backend delivery.',
     },
   ];
 
-  return templates
-    .map((template) => {
-      const matchCount = countHits(template.focus);
-      const softHitCount = countSoftHits(template.focus);
-      const gapHitCount = countGapHits(template.gapFocus ?? []);
-      const topSkillHitCount = analysis.topSkills.reduce((total, skill) => total + (template.focus.includes(normalizeToken(skill)) ? 1 : 0), 0);
-
-      const roleSpecificBoost = template.title === 'Product Engineer'
-        ? softHitCount * 6 + topSkillHitCount * 4 + gapHitCount * 2
-        : template.title === 'Frontend Engineer'
-          ? topSkillHitCount * 5 + gapHitCount * 2
-          : template.title === 'Full Stack Engineer'
-            ? topSkillHitCount * 4 + gapHitCount * 4
-            : template.title === 'Platform Engineer'
-              ? gapHitCount * 6 + topSkillHitCount * 2
-              : template.title === 'Backend / API Engineer'
-                ? gapHitCount * 5 + topSkillHitCount * 2
-                : softHitCount * 5 + topSkillHitCount * 2;
-
-      const weightedScore = 48 + (matchCount * 5) + (topSkillHitCount * 4) + (softHitCount * 3) + roleSpecificBoost;
-      const matchPercentage = Math.min(97, Math.max(55, Math.round(weightedScore)));
-
-      const fitReason = template.title === 'Product Engineer'
-        ? `This aligns with ${topSkillsText} and your strongest collaboration signals, especially ${analysis.softSkills.slice(0, 2).map((skill) => skill.name).join(' and ') || 'soft-skill strength'}.`
-        : template.title === 'Frontend Engineer'
-          ? `Best supported by your technical strengths in ${topSkillsText} and front-end focused work.`
-          : template.title === 'Full Stack Engineer'
-            ? `Good match if you want to turn ${matchedGapText} into a next-step growth area while keeping your front-end strengths.`
-            : template.title === 'Platform Engineer'
-              ? 'Strong if your analysis shows cloud, deployment, or DevOps growth opportunities that can level up your delivery.'
-              : template.title === 'Backend / API Engineer'
-                ? 'Good fit when your AI analysis highlights backend, API, or database growth opportunities.'
-                : 'Works well if your profile shows collaboration, clarity, and product communication strength.';
+  const ranked = roleCatalog
+    .map((role) => {
+      const signalHits = countHits(role.signals);
+      const skillHits = countHits(role.skills);
+      const gapHits = countGapHits(role.gapSignals);
+      const topHits = analysis.topSkills.reduce((sum, skill) => sum + (role.signals.includes(normalizeToken(skill)) ? 1 : 0), 0);
+      const typeBoost = hasEarlyCareerSignals && role.type.includes('Internship') ? 6 : role.type === 'Contract' ? 3 : 0;
+      const weighted = 52 + signalHits * 7 + skillHits * 6 + topHits * 5 + gapHits * 2 + typeBoost;
+      const matchPercentage = Math.max(55, Math.min(96, Math.round(weighted)));
+      const fitReason = `Matched on ${Math.max(signalHits + skillHits, 1)} profile signals, with strongest overlap in ${topSkillsText}.`;
 
       return {
-        id: template.id,
-        title: template.title,
-        company: template.company,
+        ...role,
         matchPercentage,
-        salary: template.salary,
-        location: template.location,
-        type: template.type,
-        skills: template.skills,
-        description: `${template.description} ${fitReason}`.trim(),
-        applyUrl: '#',
         fitReason,
       };
     })
-    .sort((a, b) => b.matchPercentage - a.matchPercentage)
-    .slice(0, 5);
+    .sort((a, b) => b.matchPercentage - a.matchPercentage);
+
+  const selected: typeof ranked = [];
+  const used = new Set<string>();
+
+  const addByType = (typeMatcher: (type: string) => boolean) => {
+    const found = ranked.find((item) => typeMatcher(item.type) && !used.has(`${item.title}|${item.company}`));
+    if (found) {
+      used.add(`${found.title}|${found.company}`);
+      selected.push(found);
+    }
+  };
+
+  // Force a varied recommendation set so the UI is not repetitive.
+  addByType((type) => type.toLowerCase() === 'full-time');
+  addByType((type) => type.toLowerCase().includes('paid'));
+  addByType((type) => type.toLowerCase().includes('unpaid'));
+  addByType((type) => type.toLowerCase() === 'contract');
+
+  for (const role of ranked) {
+    const key = `${role.title}|${role.company}`;
+    if (!used.has(key)) {
+      used.add(key);
+      selected.push(role);
+    }
+    if (selected.length >= 5) break;
+  }
+
+  return selected.slice(0, 5).map((role, index) => ({
+    id: index + 1,
+    title: role.title,
+    company: role.company,
+    matchPercentage: role.matchPercentage,
+    salary: role.salary,
+    location: role.location,
+    type: role.type,
+    skills: role.skills,
+    description: role.description,
+    applyUrl: '#',
+    fitReason: role.fitReason,
+  }));
 }
 
 function buildAILearningPath(
@@ -922,17 +1614,47 @@ function buildAILearningPath(
 
   const selected = ranked.slice(0, 4);
 
-  return selected.map((item, index) => {
-    const skillPhrase = topSkills.length > 0 ? formatList(topSkills) : 'your core skills';
+  const buildTopicContext = (topic: string): string => {
     const sourcePhrase = sources.length > 0 ? formatList(sources) : 'your linked profiles';
+    const skillPhrase = topSkills.length > 0 ? formatList(topSkills) : 'your core skills';
+
+    if (topic.includes('Frontend')) {
+      return `This extends ${skillPhrase} into visible UI delivery outcomes from ${sourcePhrase}, including measurable quality signals like testing and accessibility.`;
+    }
+
+    if (topic.includes('Backend') || topic.includes('API')) {
+      return `This uses ${skillPhrase} as a base and adds stronger backend ownership signals from ${sourcePhrase}, especially around APIs, data, and reliability.`;
+    }
+
+    if (topic.includes('Cloud') || topic.includes('CI/CD')) {
+      return `This turns current delivery signals from ${sourcePhrase} into clearer cloud and deployment evidence tied to ${skillPhrase}.`;
+    }
+
+    if (topic.includes('Testing')) {
+      return `This strengthens trust in your profile by converting ${skillPhrase} into repeatable quality signals across ${sourcePhrase}.`;
+    }
+
+    if (topic.includes('Communication') || topic.includes('Product')) {
+      return `This improves how ${sourcePhrase} communicates impact, helping ${skillPhrase} map to product and cross-functional outcomes.`;
+    }
+
+    if (topic.includes('System Design')) {
+      return `This bridges implementation strength in ${skillPhrase} with architecture-level reasoning that is currently underrepresented in ${sourcePhrase}.`;
+    }
+
+    return `This path connects ${sourcePhrase} to ${skillPhrase} while targeting the most relevant growth opportunities.`;
+  };
+
+  return selected.map((item, index) => {
     const gapPhrase = analysis.gaps.length > 0 ? formatList(analysis.gaps.slice(0, 2)) : 'the current skill gaps';
+    const contextSentence = buildTopicContext(item.topic);
 
     return {
       id: item.id,
       topic: item.topic,
       priority: item.priority,
       timeEstimate: item.timeEstimate,
-      explanation: `${item.explanation} It ties ${sourcePhrase} to ${skillPhrase}, while addressing ${gapPhrase}.`,
+      explanation: `${item.explanation} ${contextSentence} It directly addresses ${gapPhrase}.`,
       resources: item.resources,
     };
   });
@@ -940,55 +1662,72 @@ function buildAILearningPath(
 
 export async function POST(request: NextRequest) {
   try {
-    const { links }: { links: SocialLinks } = await request.json();
-    let extractedSkills: Skill[] = [];
+    const body = (await request.json()) as { links?: SocialLinks };
+    const links = body?.links ?? {};
 
-    // Scrape GitHub
-    if (links.github) {
-      const githubSkills = await scrapeGitHub(links.github);
-      extractedSkills.push(...githubSkills);
+    if (buildUrlList(links).length === 0) {
+      return NextResponse.json({ error: 'Please provide at least one public profile link.' }, { status: 400 });
     }
 
-    // Scrape LinkedIn
-    if (links.linkedin) {
-      const linkedinSkills = await scrapeLinkedIn(links.linkedin);
-      extractedSkills.push(...linkedinSkills);
+    // Verify link accessibility before scraping
+    const linkVerification = await verifyLinks(links);
+
+    if (linkVerification.accessibleCount === 0) {
+      return NextResponse.json(
+        {
+          error: 'None of the provided links are accessible.',
+          details: linkVerification.inaccessibleLinks.map((link) => ({
+            source: link.source,
+            url: link.url,
+            reason: link.error,
+          })),
+        },
+        { status: 400 },
+      );
     }
 
-    // Scrape Portfolio
-    if (links.portfolio) {
-      const portfolioSkills = await scrapePortfolio(links.portfolio);
-      extractedSkills.push(...portfolioSkills);
+    if (linkVerification.inaccessibleLinks.length > 0) {
+      console.warn('Some links are inaccessible:', linkVerification.inaccessibleLinks);
     }
 
-    // Scrape Dev.to
-    if (links.devto) {
-      const devtoSkills = await scrapeDevTo(links.devto);
-      extractedSkills.push(...devtoSkills);
-    }
+    const scrapedSources = await collectScrapedSources(links);
+    
+    // Build raw text for AI analysis
+    const allScrapedText = scrapedSources.map((s) => s.text).join(' ');
+    
+    // Calculate frequency map for data-driven scores
+    const frequencyMap = buildSkillFrequencyMap(allScrapedText);
+    const maxFrequency = Array.from(frequencyMap.values()).reduce((max, freq) => Math.max(max, freq.count), 1);
+    
+    // Convert frequency map to skills with authentic scores
+    const frequencyBasedSkills: Skill[] = Array.from(frequencyMap.values()).map((freq) => ({
+      name: freq.skill,
+      confidence: calculateFrequencyScore(freq, maxFrequency) / 100,
+      source: 'Frequency-Analysis',
+    }));
 
-    // Add fallback from resume and twitter URLs text
-    if (links.resume) {
-      extractedSkills.push(...extractSkillsFromText(links.resume, 'Resume URL'));
-    }
-    if (links.twitter) {
-      extractedSkills.push(...extractSkillsFromText(links.twitter, 'Twitter URL'));
-    }
+    // Extract text-based skills as fallback
+    const extractedSkills = aggregateSkillsByNameWithBoost(
+      scrapedSources.flatMap((source) => source.skills.length > 0 ? source.skills : extractSkillsFromText(source.text, source.source)),
+    );
 
-    // Deduplicate skill results
-    const uniqueSkillMap = new Map<string, Skill>();
-
-    extractedSkills.forEach((skill) => {
-      const key = `${skill.name.toLowerCase()}|${skill.source}`;
-      if (!uniqueSkillMap.has(key)) {
-        uniqueSkillMap.set(key, skill);
+    // Merge frequency-based with extracted skills, preferring frequency-based
+    const mergedSkills = new Map<string, Skill>();
+    
+    for (const skill of frequencyBasedSkills) {
+      mergedSkills.set(normalizeToken(skill.name), skill);
+    }
+    
+    for (const skill of extractedSkills) {
+      const key = normalizeToken(skill.name);
+      if (!mergedSkills.has(key)) {
+        mergedSkills.set(key, skill);
       }
-    });
+    }
+    
+    const finalExtractedSkills = Array.from(mergedSkills.values());
 
-    extractedSkills = Array.from(uniqueSkillMap.values());
-
-    // Combine with AI result
-    const rawText = buildProfileText(links, extractedSkills);
+    const rawText = buildProfileText(links, scrapedSources, finalExtractedSkills);
     const aiAnalysis = await analyzeProfileText(rawText).catch((error) => {
       console.error('AI analysis failure: ', error);
       return {
@@ -1007,8 +1746,8 @@ export async function POST(request: NextRequest) {
       };
     });
 
-    const processedAnalysis = enrichAnalysis(aiAnalysis, extractedSkills);
-    const sources = getProfileSources(extractedSkills);
+    const processedAnalysis = enrichAnalysis(aiAnalysis, finalExtractedSkills);
+    const sources = getProfileSources(finalExtractedSkills);
     const focusArea = detectFocusArea(processedAnalysis.technicalSkills);
     const aiStrengths = buildAIStrengths(processedAnalysis);
     const aiJobRecommendations = buildAIJobRecommendations(processedAnalysis);
@@ -1020,7 +1759,7 @@ export async function POST(request: NextRequest) {
     ];
 
     const combinedSkillsMap = new Map<string, Skill>();
-    [...extractedSkills, ...aiSkills].forEach((skill) => {
+    [...finalExtractedSkills, ...aiSkills].forEach((skill) => {
       const key = `${skill.name.toLowerCase()}|${skill.source}`;
       if (!combinedSkillsMap.has(key)) {
         combinedSkillsMap.set(key, skill);
@@ -1049,95 +1788,5 @@ export async function POST(request: NextRequest) {
       { error: 'Failed to analyze profile' },
       { status: 500 }
     );
-  }
-}
-
-async function scrapeGitHub(url: string): Promise<Skill[]> {
-  try {
-    const username = url.split('/').filter(Boolean).pop();
-    if (!username) return [];
-
-    const response = await fetch(`https://api.github.com/users/${username}/repos`);
-    if (!response.ok) return [];
-
-    const repos = await response.json();
-    const languageSet = new Set<string>();
-
-    for (const repo of repos.slice(0, 10)) {
-      if (repo.language) {
-        languageSet.add(repo.language.toLowerCase());
-      }
-      if (repo?.description) {
-        extractSkillsFromText(repo.description, 'GitHub').forEach((skill) => {
-          languageSet.add(skill.name.toLowerCase());
-        });
-      }
-    }
-
-    return Array.from(languageSet).map((lang): Skill => ({
-      name: normalizeSkill(lang),
-      confidence: 0.75,
-      source: 'GitHub',
-    }));
-  } catch (error) {
-    console.error('GitHub scrape failed:', error);
-    return [];
-  }
-}
-
-async function scrapeLinkedIn(url: string): Promise<Skill[]> {
-  try {
-    const candidateSkills = extractSkillsFromText(url, 'LinkedIn URL');
-    if (candidateSkills.length > 0) return candidateSkills;
-
-    const username = url.split('/').filter(Boolean).pop() || 'linkedin-user';
-    return [
-      { name: 'Leadership', confidence: 0.55, source: 'LinkedIn' },
-      { name: normalizeSkill(username), confidence: 0.45, source: 'LinkedIn username' },
-    ];
-  } catch {
-    return [{ name: 'Leadership', confidence: 0.5, source: 'LinkedIn' }];
-  }
-}
-
-async function scrapePortfolio(url: string): Promise<Skill[]> {
-  try {
-    const response = await fetch(url);
-    if (!response.ok) return [];
-
-    const html = await response.text();
-    const skills = extractSkillsFromText(html, 'Portfolio');
-    return skills;
-  } catch (error) {
-    console.error('Portfolio scrape failed:', error);
-    return [];
-  }
-}
-
-async function scrapeDevTo(url: string): Promise<Skill[]> {
-  try {
-    const username = url.split('/').filter(Boolean).pop();
-    if (!username) return [];
-
-    const response = await fetch(`https://dev.to/api/articles?username=${username}`);
-    if (!response.ok) return [];
-
-    const articles = await response.json();
-    let skillSet = new Set<string>();
-    articles.forEach((article: { title: string; description?: string }) => {
-      extractSkillsFromText(article.title, 'Dev.to').forEach((skill) => skillSet.add(skill.name.toLowerCase()));
-      if (article.description) {
-        extractSkillsFromText(article.description, 'Dev.to').forEach((skill) => skillSet.add(skill.name.toLowerCase()));
-      }
-    });
-
-    return Array.from(skillSet).map((skill) => ({
-      name: normalizeSkill(skill),
-      confidence: 0.65,
-      source: 'Dev.to',
-    }));
-  } catch (error) {
-    console.error('Dev.to scrape failed:', error);
-    return [];
   }
 }
